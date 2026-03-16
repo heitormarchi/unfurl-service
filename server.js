@@ -1,181 +1,163 @@
-const express = require('express');
-const { unfurl } = require('unfurl.js');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const express = require("express");
+const axios = require("axios");
+const cheerio = require("cheerio");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ===============================
-   API KEY (opcional)
-================================*/
-app.use((req, res, next) => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) return next();
-
-  const provided = req.headers['x-api-key'] || req.query.api_key;
-  if (provided !== apiKey) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-});
+const headers = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
+};
 
 /* ===============================
-   FUNÇÃO PARA EXTRAIR IMAGENS
+   Resolver links intermediários
 ================================*/
-async function extractImages(url) {
+
+function resolveTracking(url) {
   try {
-    const response = await axios.get(url, { timeout: 10000 });
-    const $ = cheerio.load(response.data);
+    const parsed = new URL(url);
 
-    const images = [];
+    if (
+      parsed.hostname.includes("mercadolivre") &&
+      parsed.pathname.includes("account-verification")
+    ) {
+      const go = parsed.searchParams.get("go");
+      if (go) return decodeURIComponent(go);
+    }
 
-    $('img').each((_, el) => {
-      let src = $(el).attr('src');
-      if (!src) return;
-
-      if (!src.startsWith('http')) {
-        try {
-          src = new URL(src, url).href;
-        } catch {}
-      }
-
-      images.push(src);
-    });
-
-    return [...new Set(images)];
+    return url;
   } catch {
-    return [];
+    return url;
   }
 }
 
 /* ===============================
-   ROTA PRINCIPAL
+   Extrair JSON-LD
 ================================*/
-app.get('/unfurl', async (req, res) => {
 
-  const { url } = req.query;
+function extractJsonLd($) {
+  const result = [];
+
+  $('script[type="application/ld+json"]').each((_, el) => {
+    try {
+      const json = JSON.parse($(el).html());
+      result.push(json);
+    } catch {}
+  });
+
+  return result;
+}
+
+/* ===============================
+   Encontrar produto
+================================*/
+
+function findProduct(jsonld) {
+  for (const obj of jsonld) {
+    if (obj["@type"] === "Product") return obj;
+
+    if (obj["@graph"]) {
+      for (const item of obj["@graph"]) {
+        if (item["@type"] === "Product") return item;
+      }
+    }
+  }
+
+  return null;
+}
+
+/* ===============================
+   ROTA
+================================*/
+
+app.get("/product", async (req, res) => {
+  let { url } = req.query;
+
   if (!url) {
     return res.status(400).json({
-      error: 'Parâmetro "url" é obrigatório'
+      error: "url obrigatória",
     });
   }
 
   try {
-
-    /* --------- HTTP request ---------- */
+    url = resolveTracking(url);
 
     const response = await axios.get(url, {
-      timeout: 10000,
-      maxRedirects: 10,
-      validateStatus: () => true
+      headers,
+      timeout: 15000,
     });
 
-    const finalUrl = response.request.res.responseUrl;
+    const finalUrl = response.request?.res?.responseUrl || url;
 
-    /* --------- metadata --------- */
+    const $ = cheerio.load(response.data);
 
-    const data = await unfurl(finalUrl, {
-      timeout: 10000,
-      follow: 10
-    });
+    const jsonld = extractJsonLd($);
 
-    /* --------- imagens --------- */
+    const product = findProduct(jsonld);
 
-    const images = await extractImages(finalUrl);
+    let image = null;
+    let description = null;
+    let price = null;
+    let promotion = false;
+    let video = null;
 
-    /* --------- redirects --------- */
+    if (product) {
+      image = Array.isArray(product.image)
+        ? product.image[0]
+        : product.image;
 
-    const redirects = response.request._redirectable?._redirects || [];
+      description = product.description || null;
+
+      if (product.offers) {
+        price = product.offers.price || null;
+
+        if (product.offers.priceSpecification) {
+          const original =
+            product.offers.priceSpecification.price;
+
+          if (original && original > price) {
+            promotion = true;
+          }
+        }
+      }
+
+      if (product.video) {
+        video = product.video.contentUrl || product.video;
+      }
+    }
+
+    /* fallback para vídeo */
+
+    if (!video) {
+      $("video source").each((_, el) => {
+        video = $(el).attr("src");
+      });
+    }
 
     res.json({
-
       url: finalUrl,
-
-      status: response.status,
-
-      redirects,
-
-      title:
-        data.open_graph?.title ||
-        data.twitter_card?.title ||
-        data.title ||
-        null,
-
-      description:
-        data.open_graph?.description ||
-        data.twitter_card?.description ||
-        data.description ||
-        null,
-
-      siteName:
-        data.open_graph?.site_name ||
-        null,
-
-      author:
-        data.author ||
-        data.article?.author ||
-        null,
-
-      lang:
-        data.lang ||
-        null,
-
-      canonical:
-        data.canonical ||
-        null,
-
-      favicon:
-        data.favicon ||
-        null,
-
-      image:
-        data.open_graph?.images?.[0]?.url ||
-        data.twitter_card?.images?.[0]?.url ||
-        images[0] ||
-        null,
-
-      images,
-
-      feeds: data.feeds || [],
-
-      headers: response.headers,
-
-      meta: data,
-
+      image,
+      video,
+      price,
+      promotion,
+      description,
     });
-
   } catch (err) {
-
     res.status(500).json({
       error: err.message,
-      url
     });
-
   }
-
 });
 
 /* ===============================
    HEALTH
 ================================*/
 
-app.get('/health', (_, res) => {
-  res.json({ status: 'ok' });
-});
-
-/* ===============================
-   ROOT
-================================*/
-
-app.get('/', (_, res) => {
-  res.json({
-    service: 'unfurl-service',
-    usage: 'GET /unfurl?url=https://exemplo.com',
-    health: 'GET /health'
-  });
+app.get("/health", (_, res) => {
+  res.json({ status: "ok" });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Unfurl service rodando na porta ${PORT}`);
+  console.log("🚀 Product scraper rodando");
 });
