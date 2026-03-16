@@ -1,5 +1,8 @@
 FROM node:20-alpine
 
+# Dependências nativas necessárias para compilar módulos do unfurl.js
+RUN apk add --no-cache python3 make g++
+
 WORKDIR /app
 
 COPY package.json .
