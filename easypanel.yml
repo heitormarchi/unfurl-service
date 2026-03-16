@@ -1,0 +1,16 @@
+name: unfurl-service
+
+services:
+  unfurl:
+    type: app
+    build:
+      type: dockerfile
+    env:
+      PORT: "3000"
+      # API_KEY: "troque-por-uma-chave-secreta"  # descomente para ativar auth
+    domains:
+      - host: unfurl.$(EASYPANEL_DOMAIN)
+        port: 3000
+    deploy:
+      replicas: 1
+      restartPolicy: always
